@@ -5,6 +5,7 @@ open System.Collections.Generic
 open JetBrains.Application.changes
 open JetBrains.DataFlow
 open JetBrains.DocumentManagers
+open JetBrains.Metadata.Reader.API
 open JetBrains.ProjectModel
 open JetBrains.ReSharper.Plugins.FSharp.Common.Checker
 open JetBrains.ReSharper.Plugins.FSharp.Common.Util
@@ -17,46 +18,63 @@ open JetBrains.Threading
 open JetBrains.Util
 open JetBrains.Util.DataStructures
 
-type FSharpScriptPsiModule(file: IProjectFile, documentManager: DocumentManager,
-                           sourceFilePropertiesManager: PsiSourceFilePropertiesManager) as this =
+type FSharpScriptPsiModule(file: IProjectFile) as this =
     inherit ConcurrentUserDataHolder()
 
+    let project = file.GetProject()
     let solution = file.GetSolution()
     let psiServices = solution.GetPsiServices()
 
-    let checkIsValid () = file.IsValid() && psiServices.Modules.HasModule(this)
+    let decorate f =
+        (this :> IDecorableProjectPsiModule).Decorators
+        |> Seq.fold (fun state decorator -> state |> f decorator) Seq.empty
 
-    interface IPsiModule with
+    interface IDecorableProjectPsiModule with
         member x.Name = file.Name
         member x.DisplayName = file.Name
         member x.GetPersistentID() = "FSharpScriptModule:" + file.Location.FullPath
 
-        member x.TargetFrameworkId = null // get highest known
-        member x.GetPsiServices() = psiServices
+        member x.Project = project
         member x.GetSolution() = solution
+        member x.GetPsiServices() = psiServices
+        member x.TargetFrameworkId = TargetFrameworkId.Default // todo: get highest known
 
         member x.PsiLanguage = FSharpLanguage.Instance :> _
         member x.ProjectFileType = FSharpScriptProjectFileType.Instance :> _
 
-        member x.SourceFiles = Seq.empty
-        member x.GetReferences(moduleReferenceResolveContext) = Seq.empty
+        member val Decorators = EmptyList.InstanceList with get, set
+        member x.SourceFiles = decorate (fun d -> d.OverrideSourceFiles)
+        member x.GetReferences(resolveContext) = decorate (fun d -> d.OverrideModuleReferences) // todo: resolve context
 
-        member x.ContainingProjectModule = null
-        member x.GetAllDefines() = EmptyList.Instance :> _
-        member x.IsValid() = checkIsValid ()
+        member x.ContainingProjectModule = project :> _
+        member x.GetAllDefines() = EmptyList.InstanceList :> _
+        member x.IsValid() = project.IsValid() && psiServices.Modules.HasModule(this)
 
 
-type FSharpScriptModuleHandler(handler) =
+type FSharpScriptModuleHandler(handler, scripts: IProjectFile list) =
     inherit DelegatingProjectPsiModuleHandler(handler)
 
-    override x.GetAllModules() = handler.GetAllModules() // todo: add script module here
+    let scriptModules = scripts |> List.map (fun s -> FSharpScriptPsiModule(s) :> IPsiModule)
+
+    override x.GetAllModules() =
+        let modules = scriptModules |> Seq.append (handler.GetAllModules())
+        modules.ToIList()
 
 
 [<SolutionComponent>]
 type FSharpScriptModuleFromProjectHandlerProvider() =
     interface IProjectPsiModuleProviderFilter with
         member x.OverrideHandler(lifetime, project, handler) =
-            FSharpScriptModuleHandler(handler) :> _, null
+            let scripts =
+                project.GetSubItemsRecursively()
+                |> Seq.choose (function
+                    | :? IProjectFile as projectFile when
+                        projectFile.LanguageType.Equals(FSharpScriptProjectFileType.Instance) -> Some projectFile
+                    | _ -> None)
+                |> List.ofSeq
+
+            if scripts.IsEmpty then handler, null else
+            FSharpScriptModuleHandler(handler, scripts) :> _, null
 
 type FSharpScriptModuleFromMiscFilesProvider() =
     class end
