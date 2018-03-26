@@ -19,6 +19,7 @@ open JetBrains.ReSharper.TestFramework
 open JetBrains.TestFramework
 open JetBrains.TestFramework.Application.Zones
 open JetBrains.Util
+open JetBrains.Util.Logging
 open Moq
 
 type Assert = NUnit.Framework.Assert
@@ -999,11 +1000,11 @@ type AnItem =
       Link: string }
 
     static member Create(itemType, evaluatedInclude, ?link) =
-        { ItemType = itemType; EvaluatedInclude = evaluatedInclude; Link = defaultArg link null } 
+        { ItemType = itemType; EvaluatedInclude = evaluatedInclude; Link = defaultArg link null }
 
 
 type LoggingFSharpItemsContainer(writer, refresher) as this =
-    inherit FSharpItemsContainer(refresher)
+    inherit FSharpItemsContainer(refresher, DummyLogger.Instance)
 
     let container = this :> IFSharpItemsContainer
 

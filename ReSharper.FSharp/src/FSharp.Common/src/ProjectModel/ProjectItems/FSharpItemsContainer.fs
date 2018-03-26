@@ -7,15 +7,18 @@ open System.Linq
 open JetBrains.Application
 open JetBrains.Application.Components
 open JetBrains.Application.DataContext
+open JetBrains.Application.PersistentMap
 open JetBrains.Application.Threading
 open JetBrains.DataFlow
 open JetBrains.Metadata.Reader.API
 open JetBrains.Platform.MsBuildHost.Models
 open JetBrains.ProjectModel
+open JetBrains.ProjectModel.Caches
 open JetBrains.ProjectModel.ProjectsHost
 open JetBrains.ProjectModel.ProjectsHost.MsBuild
 open JetBrains.ProjectModel.ProjectsHost.MsBuild.Structure
 open JetBrains.ProjectModel.ProjectsHost.SolutionHost
+open JetBrains.ProjectModel.ProjectsHost.SolutionHost.Impl
 open JetBrains.ReSharper.Feature.Services.Navigation
 open JetBrains.ReSharper.Feature.Services.Navigation.NavigationProviders
 open JetBrains.ReSharper.Host.Features.ProjectModel.Editing
@@ -29,11 +32,20 @@ open JetBrains.UI.RichText
 open JetBrains.Util
 open JetBrains.Util.Collections
 open JetBrains.Util.DataStructures
+open JetBrains.Util.Logging
+open JetBrains.Util.PersistentMap
 
 [<SolutionInstanceComponent>]
-type FSharpItemsContainer(refresher: IFSharpItemsContainerRefresher) =
+type FSharpItemsContainer
+        (lifetime: Lifetime, logger: ILogger, solutionCaches: ISolutionCaches, solutionHostManager: SolutionHostManager,
+         refresher: IFSharpItemsContainerRefresher) =
+
     let locker = JetFastSemiReenterableRWLock()
-    let projectMappings = Dictionary<IProjectMark, ProjectMapping>()
+
+    let projectMappings =
+        solutionCaches.Db.GetMap("FSharpItemsContainer",
+                UnsafeMarshallers.UnicodeStringMarshaller, ProjectMapping.Marshaller)
+            .ToOptimized(lifetime) :> IDictionary<_,_>
 
     let setComparer =
         { new IEqualityComparer<HashSet<_>> with
@@ -41,28 +53,31 @@ type FSharpItemsContainer(refresher: IFSharpItemsContainerRefresher) =
             member this.GetHashCode(x) = x.Count }
     let targetFrameworkIdIntern = DataIntern(setComparer)
 
-    let tryGetProjectMapping (projectItem: IProjectItem) =
+    let tryGetProjectMark (projectItem: IProjectItem) =
         match projectItem.GetProject() with
         | null -> None
         | project ->
             match project.GetProjectMark() with
             | null -> None
-            | projectMark -> tryGetValue projectMark projectMappings
+            | projectMark -> Some projectMark
+
+    let tryGetProjectMapping (projectMark: IProjectMark): ProjectMapping option =
+        tryGetValue projectMark.UniqueProjectName projectMappings
 
     let tryGetProjectItem (viewItem: FSharpViewItem) =
-        tryGetProjectMapping viewItem.ProjectItem
+        tryGetProjectMark viewItem.ProjectItem
+        |> Option.bind tryGetProjectMapping
         |> Option.bind (fun mapping -> mapping.TryGetProjectItem(viewItem))
 
-    let getItems (msBuildProject: MsBuildProject) itemTypeFilter =
+    let getItems (msBuildProject: MsBuildProject) itemTypeFilter yo =
         let items = List<RdProjectItemWithTargetFrameworks>()
         for rdProject in msBuildProject.RdProjects do
             let targetFrameworkId = msBuildProject.GetTargetFramework(rdProject)
             let filter = MsBuildItemTypeFilter(rdProject)
-            rdProject.Items
-            |> Seq.filter (fun item ->
-                let itemType = item.ItemType
-                not (filter.FilterByItemType(itemType, item.IsImported())) && itemTypeFilter itemType)
-            |> Seq.fold (fun index item ->
+            let projectItems = rdProject.Items |> Seq.filter (fun item -> (itemTypeFilter item.ItemType && yo) || not (filter.FilterByItemType(item.ItemType, item.IsImported()))) |> List.ofSeq
+            projectItems
+            |> List.filter (fun item -> itemTypeFilter item.ItemType)
+            |> List.fold (fun index item ->
                 if index < items.Count && items.[index].Item.EvaluatedInclude = item.EvaluatedInclude then
                     items.[index].TargetFrameworkIds.Add(targetFrameworkId) |> ignore
                     index + 1
@@ -77,6 +92,7 @@ type FSharpItemsContainer(refresher: IFSharpItemsContainerRefresher) =
                     else
                         items.[tmpIndex].TargetFrameworkIds.Add(targetFrameworkId) |> ignore
                         tmpIndex + 1) 0 |> ignore
+            projectItems |> ignore
         items
 
     member x.IsValid(viewItem: FSharpViewItem) =
@@ -88,14 +104,14 @@ type FSharpItemsContainer(refresher: IFSharpItemsContainerRefresher) =
             match msBuildProject with
             | null ->
                 use lock = locker.UsingWriteLock()
-                projectMappings.Remove(projectMark) |> ignore
+                projectMappings.Remove(projectMark.UniqueProjectName) |> ignore
             | _ ->
 
             match projectMark with
             | FSharProjectMark ->
-                let compileBeforeItems = getItems msBuildProject isCompileBefore
-                let compileAfterItems = getItems msBuildProject isCompileAfter
-                let restItems = getItems msBuildProject (changesOrder >> not)
+                let compileBeforeItems = getItems msBuildProject isCompileBefore true
+                let compileAfterItems = getItems msBuildProject isCompileAfter true 
+                let restItems = getItems msBuildProject (changesOrder >> not) false
                 let items =
                     compileBeforeItems.Concat(restItems).Concat(compileAfterItems)
                     |> Seq.map (fun item ->
@@ -104,21 +120,26 @@ type FSharpItemsContainer(refresher: IFSharpItemsContainerRefresher) =
                 let targetFrameworkIds = HashSet(msBuildProject.TargetFrameworkIds)
 
                 use lock = locker.UsingWriteLock()
-                projectMappings.[projectMark] <- ProjectMapping(projectMark, items, targetFrameworkIds, refresher)
+                projectMappings.[projectMark.UniqueProjectName] <-
+                    let projectDirectory = projectMark.Location.Directory
+                    let projectUniqueName = projectMark.UniqueProjectName
+                    let mapping = ProjectMapping(projectDirectory, projectUniqueName, targetFrameworkIds, refresher,
+                                                 solutionHostManager, logger)
+                    mapping.Update(items)
+                    mapping
                 refresher.Refresh(projectMark, true)
             | _ -> ()
 
-        // todo: add on add folder
         member x.OnAddFile(projectMark, itemType, path, linkedPath, relativeTo, relativeToType) =
             use lock = locker.UsingWriteLock()
-            tryGetValue projectMark projectMappings
+            tryGetValue projectMark.UniqueProjectName projectMappings
             |> Option.iter (fun mapping ->
                 let logicalPath = if isNotNull linkedPath then linkedPath else path
                 mapping.AddFile(itemType, path, logicalPath, relativeTo, Option.ofNullable relativeToType))
 
         member x.OnRemoveFile(projectMark, itemType, location) =
             use lock = locker.UsingWriteLock()
-            tryGetValue projectMark projectMappings
+            tryGetValue projectMark.UniqueProjectName projectMappings
             |> Option.iter (fun mapping -> mapping.RemoveFile(itemType, location))
 
         member x.OnUpdateFile(projectMark, oldItemType, oldLocation, newItemType, newLocation) =
@@ -127,7 +148,7 @@ type FSharpItemsContainer(refresher: IFSharpItemsContainerRefresher) =
                 refresher.ReloadProject(projectMark) else
 
             use lock = locker.UsingWriteLock()
-            tryGetValue projectMark projectMappings
+            tryGetValue projectMark.UniqueProjectName projectMappings
             |> Option.iter (fun mapping ->
                 mapping.UpdateFile(oldItemType, oldLocation, newItemType, newLocation)
                 refresher.Update(projectMark, newLocation))
@@ -135,17 +156,19 @@ type FSharpItemsContainer(refresher: IFSharpItemsContainerRefresher) =
         member x.OnUpdateFolder(projectMark, oldLocation, newLocation) =
             if oldLocation <> newLocation then
                 use lock = locker.UsingWriteLock()
-                tryGetValue projectMark projectMappings
+                tryGetValue projectMark.UniqueProjectName projectMappings
                 |> Option.iter (fun mapping -> mapping.UpdateFolder(oldLocation, newLocation))
+
+        member x.OnAddFolder(projectMark, path, relativeTo, relativeToType) = ()
+
+        member x.OnRemoveFolder(projectMark, path) =
+            null |> ignore
+            ()
 
         member x.CreateFoldersWithParents(folder: IProjectFolder) =
             use lock = locker.UsingReadLock()
-            match folder.GetProject() with
-            | null -> []
-            | project ->
-
-            let projectMark = project.GetProjectMark()
-            tryGetProjectMapping folder
+            tryGetProjectMark folder
+            |> Option.bind tryGetProjectMapping
             |> Option.map (fun mapping ->
                 mapping.TryGetProjectItems(folder.Location)
                 |> Seq.map (function
@@ -161,13 +184,14 @@ type FSharpItemsContainer(refresher: IFSharpItemsContainerRefresher) =
 
         member x.TryGetRelativeChildPath(projectMark, modifiedItem, relativeItem, relativeToType) =
             use lock = locker.UsingReadLock()
-            tryGetValue projectMark projectMappings
+            tryGetValue projectMark.UniqueProjectName projectMappings
             |> Option.bind (fun mapping ->
                 mapping.TryGetRelativeChildPath(modifiedItem, relativeItem, relativeToType))
 
         member x.TryGetParentFolderIdentity(viewFile: FSharpViewItem): FSharpViewFolderIdentity option =
             use lock = locker.UsingReadLock()
-            tryGetProjectMapping viewFile.ProjectItem
+            tryGetProjectMark viewFile.ProjectItem
+            |> Option.bind tryGetProjectMapping 
             |> Option.bind (fun mapping ->
                 mapping.TryGetProjectItem(viewFile)
                 |> Option.bind (fun item ->
@@ -176,21 +200,30 @@ type FSharpItemsContainer(refresher: IFSharpItemsContainerRefresher) =
                     | _ -> None))
 
         member x.Dump(writer: TextWriter) =
+            let container = solutionHostManager.ProjectsHostContainer.GetComponent<ISolutionStructureContainer>()
+            let projectMarks = container.ProjectMarks |> List.ofSeq
             use lock = locker.UsingReadLock()
-            for KeyValuePair (projectMark, mapping) in projectMappings do
-                writer.WriteLine(projectMark.Name)
+            for KeyValuePair (projectUniqueName, mapping) in projectMappings do
+                let projectName =
+                    projectMarks
+                    |> List.tryFind (fun projectMark -> projectMark.UniqueProjectName = projectUniqueName)
+                    |> Option.map (fun projectMark -> projectMark.Name)
+                    |> Option.defaultValue projectUniqueName
+                writer.WriteLine(projectName)
                 mapping.Dump(writer)
 
-        member x.TryGetSortKey(folder: FSharpViewItem) =
+        member x.TryGetSortKey(viewItem: FSharpViewItem) =
             use lock = locker.UsingReadLock()
-            tryGetProjectItem folder |> Option.map (fun item -> item.SortKey)
+            tryGetProjectItem viewItem |> Option.map (fun item -> item.SortKey)
 
         member x.IsApplicable(projectItem) =
             use lock = locker.UsingReadLock()
-            tryGetProjectMapping projectItem |> Option.isSome
+            tryGetProjectMark projectItem
+            |> Option.bind tryGetProjectMapping
+            |> Option.isSome
 
         member x.GetProjectItemsPaths(projectMark, targetFrameworkId) =
-            tryGetValue projectMark projectMappings
+            tryGetValue projectMark.UniqueProjectName projectMappings
             |> Option.map (fun mapping -> mapping.GetProjectItemsPaths(targetFrameworkId))
             |> Option.defaultValue [| |]
 
@@ -210,17 +243,40 @@ type IFSharpItemsContainer =
             (FileSystemPath * RelativeToType) option
 
 
-type ProjectMapping(projectMark, items, targetFrameworks, refresher: IFSharpItemsContainerRefresher) =
-    let itemsByPath = OneToListMap<FileSystemPath, FSharpProjectItem>()
+type ProjectMapping(projectDirectory, projectUniqueName, targetFrameworkIds, logger: ILogger) =
+
+    // Files and folders by physical path.
+    // For now we assume that a file is only included to a single item type group.
+    let files = Dictionary<FileSystemPath, FSharpProjectItem>()
+    let folders = OneToListMap<FileSystemPath, FSharpProjectItem>()
+
+    let tryGetProjectMarkForProject projectUniqueName =
+        let container = solutionHostManager.ProjectsHostContainer.GetComponent<ISolutionStructureContainer>()
+        let projectMark =
+            container.ProjectMarks |> Seq.tryFind (fun projectMark -> projectMark.UniqueProjectName = projectUniqueName)
+        match projectMark with
+        | Some projectMark -> Some projectMark
+        | None ->
+            logger.Warn(sprintf "Did not find project mark for %s" projectUniqueName)
+            None  
+
+    let tryGetFile path =
+        tryGetValue path files
+
+    let getFolders path =
+        folders.GetValuesSafe(path) |> List.ofSeq
 
     let getItemsForPath path =
-        itemsByPath.GetValuesSafe(path) |> List.ofSeq
+        tryGetFile path
+        |> Option.toList
+        |> List.append (getFolders path)
 
-    let getNewFolderIdentity(path) =
-        { Identity = (getItemsForPath path |> List.length) + 1 }
+    let getNewFolderIdentity path =
+        { Identity = (getFolders path |> List.length) + 1 }
 
     let getChildren (parent: FSharpProjectModelElement) =
-        itemsByPath.Values
+        folders.Values
+        |> Seq.append files.Values
         |> Seq.filter (fun item -> item.Parent = parent)
         |> Seq.sortBy (fun x -> x.SortKey)
 
@@ -240,11 +296,11 @@ type ProjectMapping(projectMark, items, targetFrameworks, refresher: IFSharpItem
     let addFolder parent sortKey path updateItem =
         let folderItem = FolderItem(ItemInfo.Create(path, path, parent, sortKey), getNewFolderIdentity path)
         moveFollowingItems parent sortKey MoveDirection.Down updateItem
-        itemsByPath.Add(path, folderItem)
+        folders.Add(path, folderItem)
         ProjectItem folderItem
 
     let getOrCreateFolder folderRefresher parent path =
-        itemsByPath.GetValuesSafe(path)
+        folders.GetValuesSafe(path)
         |> Seq.sortBy (fun item -> item.SortKey)
         |> Seq.tryLast
         |> Option.defaultWith (fun _ ->
@@ -252,57 +308,9 @@ type ProjectMapping(projectMark, items, targetFrameworks, refresher: IFSharpItem
 
             let itemInfo = ItemInfo.Create(path, path, parent, getNewSortKey parent)
             let folderItem = FolderItem(itemInfo, getNewFolderIdentity path)
-            itemsByPath.Add(path, folderItem) 
+            folders.Add(path, folderItem) 
             folderItem)
         |> ProjectItem
-
-    do
-        let projectDirectory = projectMark.Location.Directory
-        let folders = Stack()
-        folders.Push(State.Create(projectDirectory, Project))
-
-        let parsePaths (item: RdProjectItem) =
-            let path = FileSystemPath.TryParse(item.EvaluatedInclude)
-            if path.IsEmpty then None else
-
-            let physicalPath = path.MakeAbsoluteBasedOn(projectDirectory)
-            let logicalPath =
-                let linkPath = item.GetLink()
-                if not (linkPath.IsNullOrEmpty()) then
-                    linkPath.MakeAbsoluteBasedOn(projectDirectory)
-                elif projectDirectory.IsPrefixOf(physicalPath) then physicalPath
-                else projectDirectory.Combine(physicalPath.Name)
-            Some (physicalPath, logicalPath)
-
-        for item in items do
-            match parsePaths item.Item with
-            | Some (physicalPath, logicalPath) ->
-                Assertion.Assert(projectDirectory.IsPrefixOf(logicalPath), "Invalid logical path")
-                if logicalPath.Directory <> folders.Peek().Path then
-                    let commonParent = FileSystemPath.GetDeepestCommonParent(logicalPath.Parent, folders.Peek().Path)
-                    while (folders.Peek().Path <> commonParent) do
-                        folders.Pop() |> ignore
-
-                    let newFolders =
-                        logicalPath.GetParentDirectories() |> Seq.takeWhile (fun p -> p <> commonParent) |> Seq.rev
-
-                    for folderPath in newFolders do
-                        let currentState = folders.Peek()
-                        currentState.NextSortKey <- currentState.NextSortKey + 1
-
-                        let folder = addFolder currentState.Folder currentState.NextSortKey folderPath ignore
-                        folders.Push(State.Create(folderPath, folder))
-
-                let currentState = folders.Peek()
-                let parent = currentState.Folder
-                currentState.NextSortKey <- currentState.NextSortKey + 1
-
-                match item.Item.ItemType with
-                | Folder -> addFolder parent currentState.NextSortKey logicalPath ignore |> ignore
-                | BuildAction buildAction ->
-                    let itemInfo = ItemInfo.Create(logicalPath, physicalPath, parent, currentState.NextSortKey)
-                    itemsByPath.Add(logicalPath, FileItem (itemInfo, buildAction, item.TargetFrameworkIds))
-            | _ -> ()
 
     let (|EmptyFolder|_|) projectItem =
         match projectItem with
@@ -347,15 +355,17 @@ type ProjectMapping(projectMark, items, targetFrameworks, refresher: IFSharpItem
             itemsToUpdate.Add(item) |> ignore
 
         let refresh () =
-            match folderToRefresh with
-                | Some Project -> refresher.Refresh(projectMark, false)
-                | Some (ProjectItem (FolderItem (_, id) as folder)) ->
-                    refresher.Refresh(projectMark, folder.LogicalPath, id)
-                | _ -> ()
-            for item in itemsToUpdate do
-                match item with
-                | FileItem _ -> refresher.Update(projectMark, item.ItemInfo.LogicalPath)
-                | FolderItem (_, id) -> refresher.Update(projectMark, item.ItemInfo.LogicalPath, id)
+            tryGetProjectMarkForProject projectUniqueName
+            |> Option.iter (fun projectMark ->
+                match folderToRefresh with
+                    | Some Project -> refresher.Refresh(projectMark, false)
+                    | Some (ProjectItem (FolderItem (_, id) as folder)) ->
+                        refresher.Refresh(projectMark, folder.LogicalPath, id)
+                    | _ -> ()
+                for item in itemsToUpdate do
+                    match item with
+                    | FileItem _ -> refresher.Update(projectMark, item.ItemInfo.LogicalPath)
+                    | FolderItem (_, id) -> refresher.Update(projectMark, item.ItemInfo.LogicalPath, id))
 
         refreshFolder, updateItem, refresh
 
@@ -457,64 +467,71 @@ type ProjectMapping(projectMark, items, targetFrameworks, refresher: IFSharpItem
                 tryGetRelativeChildItem (Some (folderItem)) modifiedNodeItem relativeToType)
 
     let rec renameFolder oldLocation newLocation itemUpdater =
-        getItemsForPath oldLocation
+        getFolders oldLocation
         |> List.iter (fun folderItem ->
             folderItem.ItemInfo.LogicalPath <- newLocation
             folderItem.ItemInfo.PhysicalPath <- newLocation
-            itemsByPath.AddValue(newLocation, folderItem)
+            folders.AddValue(newLocation, folderItem)
 
             getChildren (ProjectItem folderItem)
             |> List.ofSeq
             |> List.iter (fun childItem ->
-                let oldChildLocation = oldLocation / childItem.LogicalPath.Name
+                let oldChildLocation = oldLocation / childItem.LogicalPath.Name // todo
                 let newChildLocation = newLocation / childItem.LogicalPath.Name
 
                 match childItem with
                 | FileItem _ as childFileItem ->
                     childFileItem.ItemInfo.LogicalPath <- newChildLocation
                     childFileItem.ItemInfo.PhysicalPath <- newLocation / childItem.PhysicalPath.Name
-                    itemsByPath.RemoveKey(oldChildLocation) |> ignore
-                    itemsByPath.Add(newChildLocation, childFileItem)
+                    files.Remove(oldChildLocation) |> ignore
+                    files.Add(newChildLocation, childFileItem)
                 | FolderItem _ ->
                     renameFolder oldChildLocation newChildLocation ignore)
             itemUpdater folderItem)
-        itemsByPath.RemoveKey(oldLocation) |> ignore
+        folders.RemoveKey(oldLocation) |> ignore
 
     let rec removeSplittedFolderIfEmpty folder folderPath folderRefresher itemUpdater =
-        let isFolderSplitted path = getItemsForPath path |> List.length > 1
+        let isFolderSplitted path = getFolders path |> List.length > 1
 
         match folder with
         | ProjectItem (EmptyFolder (FolderItem (_, folderId)) as folderItem) when isFolderSplitted folderPath ->
-            getItemsForPath folderPath
+            getFolders folderPath
             |> List.iter (fun folderItem ->
                 match folderItem with
                 | FolderItem (_, id) ->
                     if id.Identity > folderId.Identity then id.Identity <- id.Identity - 1
                 | _ -> ())
 
-            removeItem folderItem folderPath folderRefresher itemUpdater
+            removeItem folderItem folderRefresher itemUpdater
             folderRefresher folderItem.Parent
         | _ -> ()
 
-    and removeItem (item: FSharpProjectItem) itemPath folderRefresher itemUpdater =
+    // todo: on remove folder in container? 
+    and removeItem (item: FSharpProjectItem) folderRefresher itemUpdater =
         let siblings = getChildren item.Parent |> List.ofSeq
         let itemBefore = siblings |> List.tryFind (fun i -> i.SortKey = item.SortKey - 1)
         let itemAfter = siblings |> List.tryFind (fun i -> i.SortKey = item.SortKey + 1)
 
+        let itemPath =
+            match item with
+            | FileItem _ -> item.PhysicalPath
+            | FolderItem _ -> item.LogicalPath
         match item with
         | FileItem _ | EmptyFolder _ ->
-            joinRelativeItemsIfSplitted itemBefore itemAfter folderRefresher itemUpdater
-            itemsByPath.RemoveValue(itemPath, item) |> ignore
+            joinRelativeFoldersIfSplitted itemBefore itemAfter folderRefresher itemUpdater
+            match item with
+            | FileItem _ -> files.Remove(itemPath) |> ignore
+            | _ -> folders.RemoveValue(itemPath, item) |> ignore
 
             moveFollowingItems item.Parent item.SortKey MoveDirection.Up itemUpdater
             removeSplittedFolderIfEmpty item.Parent itemPath.Parent folderRefresher itemUpdater
         | _ ->
             failwith "removing non-empty folder"
 
-    and joinRelativeItemsIfSplitted itemBefore itemAfter folderRefresher itemUpdater =
+    and joinRelativeFoldersIfSplitted itemBefore itemAfter folderRefresher itemUpdater =
         match itemBefore, itemAfter with
         | Some (FolderItem _ as itemBefore), Some (FolderItem _ as itemAfter) when
-                itemBefore.LogicalPath = itemAfter.LogicalPath ->
+                itemBefore.PhysicalPath = itemAfter.PhysicalPath ->
 
             let folderAfterChildren = getChildren (ProjectItem itemAfter) |> List.ofSeq
             let folderBeforeChildren = getChildren (ProjectItem itemBefore) |> List.ofSeq
@@ -524,13 +541,13 @@ type ProjectMapping(projectMark, items, targetFrameworks, refresher: IFSharpItem
                 child.ItemInfo.Parent <- ProjectItem itemBefore
                 child.ItemInfo.SortKey <- folderBeforeChildrenCount + i + 1)
 
-            itemsByPath.RemoveValue(itemAfter.LogicalPath, itemAfter) |> ignore
+            folders.RemoveValue(itemAfter.PhysicalPath, itemAfter) |> ignore
             moveFollowingItems itemAfter.Parent itemAfter.SortKey MoveDirection.Up itemUpdater
 
             let lastChildBefore = List.tryLast folderBeforeChildren
             let firstChildAfter = List.tryHead folderAfterChildren
 
-            joinRelativeItemsIfSplitted lastChildBefore firstChildAfter folderRefresher itemUpdater
+            joinRelativeFoldersIfSplitted lastChildBefore firstChildAfter folderRefresher itemUpdater
             folderRefresher itemBefore.Parent
         | _ -> ()
 
@@ -555,27 +572,156 @@ type ProjectMapping(projectMark, items, targetFrameworks, refresher: IFSharpItem
                 iter (ProjectItem item)
         iter Project 
 
-    member x.UpdateFile(oldItemType, oldLocation, BuildAction buildAction, newLocation) =
-        getItemsForPath oldLocation
-        |> Seq.tryHead
-        |> Option.iter (function
-            | FileItem (info, oldBuildAction, targetFrameworkIds) ->
-                Assertion.Assert(equalsIgnoreCase oldItemType oldBuildAction.Value, "old build action mismatch")
+    member x.Update(items) =
+        let folders = Stack()
+        folders.Push(State.Create(projectDirectory, Project))
 
-                itemsByPath.RemoveKey(oldLocation) |> ignore
-                itemsByPath.Add(newLocation, FileItem (info, buildAction, targetFrameworkIds))
-                if oldLocation <> newLocation then
-                    info.LogicalPath <- newLocation
-                    info.PhysicalPath <- newLocation
-            | item -> sprintf "got item %O" item |> failwith)
+        let parsePaths (item: RdProjectItem) =
+            let path = FileSystemPath.TryParse(item.EvaluatedInclude)
+            if path.IsEmpty then None else
+
+            let physicalPath = path.MakeAbsoluteBasedOn(projectDirectory)
+            let logicalPath =
+                let linkPath = item.GetLink()
+                if not (linkPath.IsNullOrEmpty()) then
+                    linkPath.MakeAbsoluteBasedOn(projectDirectory)
+                elif projectDirectory.IsPrefixOf(physicalPath) then physicalPath
+                else projectDirectory.Combine(physicalPath.Name)
+            Some (physicalPath, logicalPath)
+
+        for item in items do
+            match parsePaths item.Item with
+            | Some (physicalPath, logicalPath) ->
+                Assertion.Assert(projectDirectory.IsPrefixOf(logicalPath), "Invalid logical path")
+                if logicalPath.Directory <> folders.Peek().Path then
+                    let commonParent = FileSystemPath.GetDeepestCommonParent(logicalPath.Parent, folders.Peek().Path)
+                    while (folders.Peek().Path <> commonParent) do
+                        folders.Pop() |> ignore
+
+                    let newFolders =
+                        logicalPath.GetParentDirectories() |> Seq.takeWhile (fun p -> p <> commonParent) |> Seq.rev
+
+                    for folderPath in newFolders do
+                        let currentState = folders.Peek()
+                        currentState.NextSortKey <- currentState.NextSortKey + 1
+
+                        let folder = addFolder currentState.Folder currentState.NextSortKey folderPath ignore
+                        folders.Push(State.Create(folderPath, folder))
+
+                let currentState = folders.Peek()
+                let parent = currentState.Folder
+                currentState.NextSortKey <- currentState.NextSortKey + 1
+
+                match item.Item.ItemType with
+                | Folder -> addFolder parent currentState.NextSortKey logicalPath ignore |> ignore
+                | BuildAction buildAction ->
+                    let itemInfo = ItemInfo.Create(logicalPath, physicalPath, parent, currentState.NextSortKey)
+                    if files.ContainsKey(physicalPath) then
+                        logger.Warn(sprintf "%O added twice" physicalPath)
+                        files.Remove(physicalPath) |> ignore
+                    files.Add(physicalPath, FileItem (itemInfo, buildAction, item.TargetFrameworkIds))
+            | _ -> ()
+
+    member x.Write(writer: UnsafeWriter) =
+        let writeTargetFrameworkIds ids =
+            writer.Write(UnsafeWriter.WriteDelegate(fun writer (value: TargetFrameworkId) ->
+                value.Write(writer)), ids)
+
+        writer.Write(projectDirectory)
+        writer.Write(projectUniqueName)
+        writeTargetFrameworkIds targetFrameworkIds
+
+        let foldersIds = Dictionary<FSharpProjectModelElement, int>()
+        let getFolderId el =
+            foldersIds.GetOrCreateValue(el, fun () -> foldersIds.Count)
+
+        foldersIds.[Project] <- 0
+
+        iter (fun projectItem ->
+            let info = projectItem.ItemInfo
+            writer.Write(info.PhysicalPath)
+            writer.Write(info.LogicalPath)
+            writer.Write(getFolderId info.Parent)
+            writer.Write(info.SortKey)
+
+            match projectItem with
+            | FileItem (_, buildAction, targetFrameworks) ->
+                writer.Write(int FSharpProjectItemType.File)
+                writer.Write(buildAction.Value)
+                writeTargetFrameworkIds targetFrameworks
+
+            | FolderItem (_, identity) ->
+                writer.Write(int FSharpProjectItemType.Folder)
+                writer.Write(getFolderId (ProjectItem projectItem))
+                writer.Write(identity.Identity))
+
+    member private x.AddItem(path, item: FSharpProjectItem) =
+        let path = item.PhysicalPath
+        match item with
+        | FileItem _ -> files.[path] <- item
+        | FolderItem _ -> folders.AddValue(path, item)
+
+    static member Read(reader: UnsafeReader) =
+        let projectDirectory = reader.ReadFileSystemPath()
+        let projectUniqueName = reader.ReadString()
+        let targetFrameworkIds =
+            reader.ReadCollection(UnsafeReader.ReadDelegate(TargetFrameworkId.Read), fun _ -> HashSet())
+
+        let logger = Logger.GetLogger<FSharpItemsContainer>()
+        let mapping = ProjectMapping(projectDirectory, projectUniqueName, targetFrameworkIds, logger) :> ProjectMapping
+        let foldersById = Dictionary<int, FSharpProjectModelElement>()
+        foldersById.[0] <- Project
+
+        let itemInfo =
+            { PhysicalPath = reader.ReadFileSystemPath()
+              LogicalPath = reader.ReadFileSystemPath()
+              Parent = foldersById.[reader.ReadInt()]
+              SortKey = reader.ReadInt() }
+
+        let item =
+            match reader.ReadInt() |> LanguagePrimitives.EnumOfValue with
+            | FSharpProjectItemType.File ->
+                let (BuildAction buildAction) = reader.ReadString()
+                let frameworks = HashSet() // todo: read frameworks
+                FileItem(itemInfo, buildAction, frameworks)
+
+            | FSharpProjectItemType.Folder ->
+                let id = reader.ReadInt()
+                let folderIdentity = { Identity = reader.ReadInt() }
+                let item = FolderItem(itemInfo, folderIdentity)
+                foldersById.[id] <- ProjectItem item
+                item
+
+            | itemType -> sprintf "got item %O" itemType |> failwith
+
+        mapping.AddItem(item)
+
+        mapping
+
+    static member Marshaller =
+        { new IUnsafeMarshaller<ProjectMapping> with
+            member x.Marshal(writer, value) = value.Write(writer)
+            member x.Unmarshal(reader) = ProjectMapping.Read(reader) }
+
+    member x.UpdateFile(oldItemType, oldLocation, BuildAction buildAction, newLocation) =
+        match tryGetFile oldLocation with
+        | Some (FileItem (info, oldBuildAction, targetFrameworkIds)) ->
+            Assertion.Assert(equalsIgnoreCase oldItemType oldBuildAction.Value, "old build action mismatch")
+
+            files.Remove(oldLocation) |> ignore
+            files.Add(newLocation, FileItem (info, buildAction, targetFrameworkIds))
+            if oldLocation <> newLocation then
+                info.LogicalPath <- newLocation
+                info.PhysicalPath <- newLocation
+        | item -> sprintf "got item %O" item |> failwith
 
     member x.RemoveFile(itemType, location) =
         let folderRefresher, itemUpdater, refresh = createRefreshers ()
-        getItemsForPath location
-        |> Seq.tryHead
-        |> Option.iter (fun item ->
-            removeItem item location folderRefresher itemUpdater
-            refresh ())
+        match tryGetFile location with
+        | Some (FileItem _ as item) ->
+            removeItem item folderRefresher itemUpdater
+            refresh ()
+        | item -> sprintf "got item %O" item |> failwith
 
     member x.UpdateFolder(oldLocation, newLocation) =
         Assertion.Assert(oldLocation.Parent = newLocation.Parent, "oldLocation.Parent = newLocation.Parent")
@@ -584,14 +730,15 @@ type ProjectMapping(projectMark, items, targetFrameworks, refresher: IFSharpItem
         refresh ()
 
     member x.TryGetProjectItem(viewItem: FSharpViewItem): FSharpProjectItem option =
-        let itemsForPath = getItemsForPath viewItem.ProjectItem.Location
+        let path = viewItem.ProjectItem.Location
         match viewItem with
-        | :? FSharpViewFile -> List.tryHead itemsForPath
+        | :? FSharpViewFile -> tryGetFile path
         | :? FSharpViewFolder as viewFolder ->
-            itemsForPath |> List.tryFind (function
+            getFolders path
+            |> List.tryFind (function
                 | FolderItem (_, id) -> id = viewFolder.Identitiy
                 | _ -> false)
-        | _ -> None
+        | item -> sprintf "got item %O" item |> failwith
 
     member x.TryGetProjectItems(path: FileSystemPath): FSharpProjectItem list =
         getItemsForPath path
@@ -601,9 +748,11 @@ type ProjectMapping(projectMark, items, targetFrameworks, refresher: IFSharpItem
 
         let tryGetPossiblyRelativeNodeItem path =
             if isNull path then None else
-            match getItemsForPath path with
-            | (FileItem _ | EmptyFolder _) as item :: [] -> Some item
-            | _ -> None
+            tryGetFile path
+            |> Option.orElseWith (fun _ ->
+                match getFolders path with
+                | EmptyFolder _ as item :: [] -> Some item
+                | _ -> None)
 
         let parent, sortKey =
             match tryGetPossiblyRelativeNodeItem relativeToPath, relativeToType with
@@ -638,14 +787,15 @@ type ProjectMapping(projectMark, items, targetFrameworks, refresher: IFSharpItem
             | _ ->
                 let parent =
                     logicalPath.GetParentDirectories()
-                    |> Seq.takeWhile (fun p -> p <> projectMark.Location.Directory)
+                    |> Seq.takeWhile (fun p -> p <> projectDirectory)
                     |> Seq.rev
                     |> Seq.fold (getOrCreateFolder folderRefresher) Project
                 parent, getNewSortKey parent
 
         let itemInfo = ItemInfo.Create(logicalPath, physicalPath, parent, sortKey)
-        itemsByPath.Add(logicalPath, FileItem(itemInfo, buildAction, targetFrameworks))
-        refresher.SelectItem(projectMark, logicalPath)
+        files.Add(physicalPath, FileItem(itemInfo, buildAction, targetFrameworkIds))
+        tryGetProjectMarkForProject projectUniqueName
+        |> Option.iter (fun projectMark -> refresher.SelectItem(projectMark, logicalPath))
         refresh ()
 
     member x.TryGetRelativeChildPath(modifiedItem, relativeItem, relativeToType) =
@@ -684,7 +834,7 @@ type ProjectMapping(projectMark, items, targetFrameworks, refresher: IFSharpItem
                 dump (ProjectItem item) (ident + 1)
         dump Project 0
 
-        for targetFrameworkId in targetFrameworks do
+        for targetFrameworkId in targetFrameworkIds do
             writer.WriteLine()
             writer.WriteLine(targetFrameworkId)
             x.GetProjectItemsPaths(targetFrameworkId)
@@ -729,6 +879,10 @@ type FSharpProjectItem =
             let (UnixSeparators path) = x.PhysicalPath
             sprintf "%s (from %s)" name path
 
+[<RequireQualifiedAccess>]
+type FSharpProjectItemType =
+    | File = 0
+    | Folder = 1
 
 
 type ItemInfo =
@@ -853,9 +1007,8 @@ type FSharpItemsContainerRefresher(lifetime: Lifetime, solution: ISolution, view
 type FSharpViewItem(item: IProjectItem) =
     inherit ProjectElementHolder(item)
 
-    member x.ProjectItem = item
+    member x.ProjectItem: IProjectItem = item
     member x.Location = item.Location
-    member x.Name = item.Name
 
 
 type FSharpViewFile(file: IProjectFile) =
