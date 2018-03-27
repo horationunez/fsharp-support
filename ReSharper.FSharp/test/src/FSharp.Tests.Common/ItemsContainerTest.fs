@@ -7,12 +7,15 @@ open System.Linq
 open System.Text.RegularExpressions
 open JetBrains.Application.BuildScript.Application.Zones
 open JetBrains.Application.Environment
+open JetBrains.DataFlow
 open JetBrains.Platform.MsBuildHost.Models
 open JetBrains.ProjectModel
+open JetBrains.ProjectModel.Caches
 open JetBrains.ProjectModel.ProjectsHost
 open JetBrains.ProjectModel.ProjectsHost
 open JetBrains.ProjectModel.ProjectsHost.Impl
 open JetBrains.ProjectModel.ProjectsHost.MsBuild
+open JetBrains.ProjectModel.ProjectsHost.SolutionHost.Impl
 open JetBrains.ReSharper.Plugins.FSharp.Common.Util
 open JetBrains.ReSharper.Plugins.FSharp.ProjectModel.ProjectItems.ItemsContainer
 open JetBrains.ReSharper.TestFramework
@@ -1004,7 +1007,8 @@ type AnItem =
 
 
 type LoggingFSharpItemsContainer(writer, refresher) as this =
-    inherit FSharpItemsContainer(refresher, DummyLogger.Instance)
+    inherit FSharpItemsContainer(Lifetimes.Define().Lifetime, DummyLogger.Instance, Mock<ISolutionCaches>().Object,
+                                 Mock<SolutionHostManager>().Object, refresher)
 
     let container = this :> IFSharpItemsContainer
 
